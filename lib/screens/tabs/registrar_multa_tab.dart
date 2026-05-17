@@ -8,18 +8,48 @@ class RegistrarMultaTab extends StatefulWidget {
   State<RegistrarMultaTab> createState() => _RegistrarMultaTabState();
 }
 
-class _RegistrarMultaTabState extends State<RegistrarMultaTab> {
-  final TextEditingController _nombreController = TextEditingController();
+class _RegistrarMultaTabState extends State<RegistrarMultaTab> with SingleTickerProviderStateMixin {
+  late TabController _tabController;
+  
+  final TextEditingController _nuevoNombreController = TextEditingController();
+  final TextEditingController _buscarNombreController = TextEditingController();
   final TextEditingController _valorController = TextEditingController();
   final TextEditingController _motivoController = TextEditingController();
 
   String? _categoriaSeleccionada = "Otra";
   List<Map<String, dynamic>> _sugerencias = [];
+  bool _isLoading = false;
 
-  // Normalizar texto (para manejar ñ, acentos, etc.)
+  @override
+  void initState() {
+    super.initState();
+    _tabController = TabController(length: 2, vsync: this);
+    
+    // Limpiar controladores al cambiar de pestaña para evitar cruce de datos
+    _tabController.addListener(() {
+      if (_tabController.indexIsChanging) {
+        _nuevoNombreController.clear();
+        _buscarNombreController.clear();
+        setState(() => _sugerencias = []);
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _tabController.dispose();
+    _nuevoNombreController.dispose();
+    _buscarNombreController.dispose();
+    _valorController.dispose();
+    _motivoController.dispose();
+    super.dispose();
+  }
+
+  // Normalizador potente para ignorar tildes, diéresis y la letra Ñ
   String _normalizar(String texto) {
     return texto
         .toLowerCase()
+        .trim()
         .replaceAll('ñ', 'n')
         .replaceAll('á', 'a')
         .replaceAll('é', 'e')
@@ -29,20 +59,20 @@ class _RegistrarMultaTabState extends State<RegistrarMultaTab> {
         .replaceAll('ü', 'u');
   }
 
-  // Buscador potente
-  Future<void> _buscarDeudores(String query) async {
+  // Buscador que filtra en la colección de movimientos
+  Future<void> _buscarDeudoresInmune(String query) async {
     if (query.length < 2) {
       setState(() => _sugerencias = []);
       return;
     }
 
+    final String queryNormal = _normalizar(query);
+
     final snapshot = await FirebaseFirestore.instance
         .collection('movimientos')
-        .limit(50)
         .get();
 
     final Map<String, Map<String, dynamic>> tempMap = {};
-    final String queryNormal = _normalizar(query);
 
     for (var doc in snapshot.docs) {
       final data = doc.data();
@@ -52,7 +82,7 @@ class _RegistrarMultaTabState extends State<RegistrarMultaTab> {
       final String nombreNormal = _normalizar(nombreRaw);
       final String nombreMostrar = nombreRaw.toUpperCase();
 
-      // Busca si coincide con la consulta normalizada
+      // Comparación usando strings completamente normalizados
       if (!nombreNormal.contains(queryNormal)) continue;
 
       if (!tempMap.containsKey(nombreMostrar)) {
@@ -76,20 +106,25 @@ class _RegistrarMultaTabState extends State<RegistrarMultaTab> {
     });
   }
 
-  Future<void> _guardarMulta() async {
-    final nombre = _nombreController.text.trim();
-    if (nombre.isEmpty || _valorController.text.isEmpty) {
+  Future<void> _guardarMulta(bool esNuevo) async {
+    // Selecciona el nombre dependiendo de la pestaña activa en el TabBar
+    final nombre = esNuevo ? _nuevoNombreController.text.trim() : _buscarNombreController.text.trim();
+    final valorText = _valorController.text.trim();
+
+    if (nombre.isEmpty || valorText.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Nombre y valor son obligatorios")),
+        const SnackBar(content: Text("⚠️ Nombre y valor son obligatorios"), backgroundColor: Colors.orange),
       );
       return;
     }
 
-    final valor = int.tryParse(_valorController.text) ?? 0;
+    final valor = int.tryParse(valorText) ?? 0;
+
+    setState(() => _isLoading = true);
 
     await FirebaseFirestore.instance.collection('movimientos').add({
       'tipo': 'multa',
-      'nombreDeudor': nombre.toLowerCase(),
+      'nombreDeudor': nombre.toLowerCase(), // Se guarda ordenado en minúsculas en Firebase
       'valor': valor,
       'descripcion': _categoriaSeleccionada,
       'motivo': _motivoController.text.trim().isEmpty
@@ -99,8 +134,15 @@ class _RegistrarMultaTabState extends State<RegistrarMultaTab> {
       'registradoPor': 'admin',
     });
 
+    // Limpieza completa del estado después de subir los datos
+    _nuevoNombreController.clear();
+    _buscarNombreController.clear();
     _valorController.clear();
     _motivoController.clear();
+    setState(() {
+      _sugerencias = [];
+      _isLoading = false;
+    });
 
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -111,137 +153,182 @@ class _RegistrarMultaTabState extends State<RegistrarMultaTab> {
 
   @override
   Widget build(BuildContext context) {
-    return SingleChildScrollView(
-      padding: const EdgeInsets.all(16),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Text("Nueva Multa", style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
-          const SizedBox(height: 20),
-
-          // BUSCADOR CON TARJETAS
-          Autocomplete<Map<String, dynamic>>(
-            optionsBuilder: (TextEditingValue textEditingValue) {
-              if (textEditingValue.text.length < 2) return const Iterable.empty();
-              return _sugerencias.where((deudor) =>
-                  deudor['nombre'].toString().toLowerCase().contains(textEditingValue.text.toLowerCase()));
-            },
-            displayStringForOption: (deudor) => deudor['nombre'],
-            onSelected: (Map<String, dynamic> deudor) {
-              _nombreController.text = deudor['nombre'];
-            },
-            fieldViewBuilder: (context, controller, focusNode, onFieldSubmitted) {
-              return TextField(
-                controller: controller,
-                focusNode: focusNode,
-                onChanged: _buscarDeudores,
-                decoration: const InputDecoration(
-                  labelText: "Nombre del Aprendiz",
-                  hintText: "Escribe nombre o apellido...",
-                  prefixIcon: Icon(Icons.search),
-                  border: OutlineInputBorder(),
-                ),
-              );
-            },
-            optionsViewBuilder: (context, onSelected, options) {
-              return Align(
-                alignment: Alignment.topLeft,
-                child: Material(
-                  elevation: 4,
-                  borderRadius: BorderRadius.circular(8),
-                  child: Container(
-                    width: MediaQuery.of(context).size.width * 0.92,
-                    constraints: const BoxConstraints(maxHeight: 350),
-                    child: ListView.builder(
-                      padding: const EdgeInsets.all(8),
-                      itemCount: options.length,
-                      itemBuilder: (context, index) {
-                        final deudor = options.elementAt(index);
-                        final saldo = deudor['multas'] - deudor['pagos'];
-
-                        return ListTile(
-                          leading: Icon(
-                            saldo > 0 ? Icons.warning_amber_rounded : Icons.paid,
-                            color: saldo > 0 ? Colors.red : Colors.green,
-                          ),
-                          title: Text(deudor['nombre'], style: const TextStyle(fontWeight: FontWeight.bold)),
-                          subtitle: Text(
-                            "Multas: \$${deudor['multas']} | Pagos: \$${deudor['pagos']}",
-                          ),
-                          trailing: Text(
-                            "\$$saldo",
-                            style: TextStyle(
-                              fontWeight: FontWeight.bold,
-                              color: saldo > 0 ? Colors.red : Colors.green,
-                            ),
-                          ),
-                          onTap: () => onSelected(deudor),
-                        );
-                      },
-                    ),
-                  ),
-                ),
-              );
-            },
-          ),
-
-          const SizedBox(height: 20),
-
-          DropdownButtonFormField<String>(
-            initialValue: _categoriaSeleccionada,
-            decoration: const InputDecoration(
-              labelText: "Categoría de la Multa",
-              border: OutlineInputBorder(),
-            ),
-            items: const [
-              DropdownMenuItem(value: "Uniforme", child: Text("Uniforme")),
-              DropdownMenuItem(value: "Aseo", child: Text("Aseo")),
-              DropdownMenuItem(value: "Grosería", child: Text("Grosería")),
-              DropdownMenuItem(value: "Otra", child: Text("Otra")),
+    return DefaultTabController(
+      length: 2,
+      child: Scaffold(
+        appBar: AppBar(
+          toolbarHeight: 0, // Eliminamos la barra de título superior para maximizar el espacio vertical
+          backgroundColor: Colors.white,
+          bottom: TabBar(
+            controller: _tabController,
+            labelColor: Colors.blue,
+            unselectedLabelColor: Colors.grey,
+            indicatorColor: Colors.blue,
+            tabs: const [
+              Tab(icon: Icon(Icons.person_add), text: "Nuevo Aprendiz"),
+              Tab(icon: Icon(Icons.search), text: "Buscar Existente"),
             ],
-            onChanged: (value) => setState(() => _categoriaSeleccionada = value),
           ),
+        ),
+        body: _isLoading 
+          ? const Center(child: CircularProgressIndicator())
+          : SafeArea(
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text("Nueva Multa", style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
+                    const SizedBox(height: 16),
 
-          const SizedBox(height: 16),
+                    // Selector de contenido dinámico basado en la pestaña activa
+                    AnimatedContainer(
+                      duration: const Duration(milliseconds: 200),
+                      constraints: const BoxConstraints(minHeight: 70),
+                      child: [
+                        // PESTAÑA 1: AGREGAR NUEVO APRENDIZ
+                        TextField(
+                          controller: _nuevoNombreController,
+                          textCapitalization: TextCapitalization.characters,
+                          decoration: const InputDecoration(
+                            labelText: "Nombre del Nuevo Aprendiz",
+                            hintText: "Escribe el nombre completo...",
+                            prefixIcon: Icon(Icons.person),
+                            border: OutlineInputBorder(),
+                          ),
+                        ),
 
-          TextField(
-            controller: _valorController,
-            keyboardType: TextInputType.number,
-            decoration: const InputDecoration(
-              labelText: "Valor (COP)",
-              prefixText: "\$ ",
-              border: OutlineInputBorder(),
-            ),
-          ),
+                        // PESTAÑA 2: BUSCAR APRENDIZ EXISTENTE (Autocomplete predictivo fijo)
+                        Autocomplete<Map<String, dynamic>>(
+                          optionsBuilder: (TextEditingValue textEditingValue) {
+                            if (textEditingValue.text.length < 2) return const Iterable.empty();
+                            return _sugerencias;
+                          },
+                          displayStringForOption: (deudor) => deudor['nombre'],
+                          onSelected: (Map<String, dynamic> deudor) {
+                            _buscarNombreController.text = deudor['nombre'];
+                          },
+                          fieldViewBuilder: (context, controller, focusNode, onFieldSubmitted) {
+                            return TextField(
+                              controller: controller,
+                              focusNode: focusNode,
+                              textCapitalization: TextCapitalization.characters,
+                              onChanged: (val) {
+                                _buscarNombreController.text = val;
+                                _buscarDeudoresInmune(val);
+                              },
+                              decoration: const InputDecoration(
+                                labelText: "Buscar Aprendiz",
+                                hintText: "Escribe para buscar (ej: jefer pe)...",
+                                prefixIcon: Icon(Icons.search),
+                                border: OutlineInputBorder(),
+                              ),
+                            );
+                          },
+                          optionsViewBuilder: (context, onSelected, options) {
+                            return Align(
+                              alignment: Alignment.topLeft,
+                              child: Material(
+                                elevation: 4,
+                                borderRadius: BorderRadius.circular(8),
+                                child: Container(
+                                  width: MediaQuery.of(context).size.width * 0.92,
+                                  constraints: const BoxConstraints(maxHeight: 200), // Altura óptima para evitar overflows
+                                  child: ListView.builder(
+                                    padding: const EdgeInsets.all(8),
+                                    itemCount: options.length,
+                                    itemBuilder: (context, index) {
+                                      final deudor = options.elementAt(index);
+                                      final saldo = deudor['multas'] - deudor['pagos'];
 
-          const SizedBox(height: 16),
+                                      return ListTile(
+                                        leading: Icon(
+                                          saldo > 0 ? Icons.warning_amber_rounded : Icons.paid,
+                                          color: saldo > 0 ? Colors.red : Colors.green,
+                                        ),
+                                        title: Text(deudor['nombre'], style: const TextStyle(fontWeight: FontWeight.bold)),
+                                        subtitle: Text("Multas: \$${deudor['multas']} | Pagos: \$${deudor['pagos']}"),
+                                        trailing: Text(
+                                          "\$$saldo",
+                                          style: TextStyle(
+                                            fontWeight: FontWeight.bold,
+                                            color: saldo > 0 ? Colors.red : Colors.green,
+                                          ),
+                                        ),
+                                        onTap: () => onSelected(deudor),
+                                      );
+                                    },
+                                  ),
+                                ),
+                              ),
+                            );
+                          },
+                        ),
+                      ][_tabController.index],
+                    ),
 
-          TextField(
-            controller: _motivoController,
-            decoration: const InputDecoration(
-              labelText: "Motivo adicional (Opcional)",
-              border: OutlineInputBorder(),
-            ),
-            maxLines: 2,
-          ),
+                    const SizedBox(height: 16),
 
-          const SizedBox(height: 30),
+                    // CAMPOS COMUNES DEL FORMULARIO
+                    DropdownButtonFormField<String>(
+                      initialValue: _categoriaSeleccionada,
+                      decoration: const InputDecoration(
+                        labelText: "Categoría de la Multa",
+                        border: OutlineInputBorder(),
+                      ),
+                      items: const [
+                        DropdownMenuItem(value: "Uniforme", child: Text("Uniforme")),
+                        DropdownMenuItem(value: "Aseo", child: Text("Aseo")),
+                        DropdownMenuItem(value: "Grosería", child: Text("Grosería")),
+                        DropdownMenuItem(value: "Otra", child: Text("Otra")),
+                      ],
+                      onChanged: (value) => setState(() => _categoriaSeleccionada = value),
+                    ),
 
-          SizedBox(
-            width: double.infinity,
-            height: 55,
-            child: ElevatedButton.icon(
-              onPressed: _guardarMulta,
-              icon: const Icon(Icons.save),
-              label: const Text("GUARDAR REGISTRO", style: TextStyle(fontSize: 18)),
-              style: ElevatedButton.styleFrom(
-                backgroundColor: Colors.blue,
-                foregroundColor: Colors.white,
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                    const SizedBox(height: 14),
+
+                    TextField(
+                      controller: _valorController,
+                      keyboardType: TextInputType.number,
+                      decoration: const InputDecoration(
+                        labelText: "Valor (COP)",
+                        prefixText: "\$ ",
+                        border: OutlineInputBorder(),
+                      ),
+                    ),
+
+                    const SizedBox(height: 14),
+
+                    TextField(
+                      controller: _motivoController,
+                      decoration: const InputDecoration(
+                        labelText: "Motivo adicional (Opcional)",
+                        border: OutlineInputBorder(),
+                      ),
+                      maxLines: 2,
+                    ),
+
+                    const SizedBox(height: 24),
+
+                    // BOTÓN DE GUARDADO ADAPTATIVO
+                    SizedBox(
+                      width: double.infinity,
+                      height: 50, // Altura compacta para prevenir desbordes de pantalla
+                      child: ElevatedButton.icon(
+                        onPressed: () => _guardarMulta(_tabController.index == 0),
+                        icon: const Icon(Icons.save),
+                        label: const Text("GUARDAR REGISTRO", style: TextStyle(fontSize: 18)),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.blue,
+                          foregroundColor: Colors.white,
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
               ),
             ),
-          ),
-        ],
       ),
     );
   }
